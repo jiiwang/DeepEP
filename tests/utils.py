@@ -33,7 +33,6 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_device('cuda')
     torch.cuda.set_device(local_rank)
 
-    # dist.new_group creates a dedicated, named communication context for a specific list of participants.
     return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
 
@@ -98,7 +97,7 @@ def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_gro
     return (scores * mask).view(num_tokens, num_experts)
 
 
-def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
+def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None, print_trace: bool = False, trace_file=None):
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
@@ -123,6 +122,17 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     torch.cuda.synchronize()
 
     times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
+    raw_events = [[start_events[0].elapsed_time(s) * 1e3, s.elapsed_time(e) * 1e3] for s, e in zip(start_events, end_events)][1:]
+    
+    for s, duration in raw_events:
+        if print_trace or trace_file:
+            msg = f"[phase 1, rank {dist.get_rank()}], kernel=combined, start_timestamp={s}, duration={duration} us"
+            if print_trace:
+                print(msg)
+            if trace_file:
+                trace_file.write(msg + '\n')
+                trace_file.flush()
+
     return np.average(times), np.min(times), np.max(times)
 
 
@@ -174,23 +184,28 @@ class suppress_stdout_stderr:
 def bench_kineto(fn,
                  kernel_names: Union[str, tuple],
                  num_tests: int = 30,
+                 num_warmups: int = 30,
                  suppress_kineto_output: bool = False,
                  trace_path: Optional[str] = None,
                  barrier_comm_profiling: bool = False,
-                 num_kernels_per_period: int = 1):
+                 num_kernels_per_period: int = 1,
+                 print_trace: bool = False,
+                 trace_file=None):
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
         schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
-            for _ in range(2):
+            for step in range(2):
                 # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
                 if barrier_comm_profiling:
                     lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
                     rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
                     lhs @ rhs
                     dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
-                for _ in range(num_tests):
+                # Use fewer iterations for the warm-up step (step 0)
+                current_num_tests = num_warmups if step == 0 else num_tests
+                for _ in range(current_num_tests):
                     fn()
                 torch.cuda.synchronize()
                 prof.step()
@@ -205,8 +220,40 @@ def bench_kineto(fn,
         assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
 
     # Save chrome traces
+    # if trace_path is not None:
+    #    prof.export_chrome_trace(trace_path)
+
+    # Export trace
+    profile_data = None
     if trace_path is not None:
         prof.export_chrome_trace(trace_path)
+        if num_kernels_per_period >= 1:
+            profile_data = json.loads(Path(trace_path).read_text())
+    elif num_kernels_per_period >= 1:
+        with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
+            prof.export_chrome_trace(tmp.name)
+            profile_data = json.loads(Path(tmp.name).read_text())
+    
+    # Get GEMM timestamps and durations
+    if num_kernels_per_period > 1 and profile_data is not None:
+        # Filter for events that actually have timing info
+        all_events = [event for event in profile_data['traceEvents'] if 'gemm' in event['name'].lower()]
+        # Sort by timestamp
+        all_events.sort(key=lambda x: x['ts'])
+        
+        # Skip the first warm-up run
+        if barrier_comm_profiling:
+            if len(all_events) > 0:
+                all_events = all_events[1:]
+
+        for event in all_events:
+            if print_trace or trace_file:
+                msg = f"[phase 3, rank {dist.get_rank()}], kernel=gemm, start_timestamp={event['ts']}, duration={event['dur']}"
+                if print_trace:
+                    print(msg)
+                if trace_file:
+                    trace_file.write(msg + '\n')
+                    trace_file.flush()
 
     # Return average kernel durations
     units = {'ms': 1e3, 'us': 1e6}
@@ -222,18 +269,37 @@ def bench_kineto(fn,
                 break
 
     # Expand the kernels by periods
-    if num_kernels_per_period > 1:
-        with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
-            prof.export_chrome_trace(tmp.name)
-            profile_data = json.loads(Path(tmp.name).read_text())
+    if num_kernels_per_period >= 1 and profile_data is not None:
+        # with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
+        #    prof.export_chrome_trace(tmp.name)
+        #    profile_data = json.loads(Path(tmp.name).read_text())
 
         for i, kernel_name in enumerate(kernel_names):
             events = [event for event in profile_data['traceEvents'] if f'::{kernel_name}' in event['name']]
             events = sorted(events, key=lambda event: event['ts'])
             durations = [event['dur'] / 1e6 for event in events]
-            assert len(durations) % num_kernels_per_period == 0
-            num_kernel_patterns = len(durations) // num_kernels_per_period
-            kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns for j in range(num_kernels_per_period)]
+            
+            if num_kernels_per_period == 1:
+                for event in events:
+                    if print_trace or trace_file:
+                        msg = f"[phase 2, rank {dist.get_rank()}], kernel={kernel_name}, start_timestamp={event['ts']}, duration={event['dur']}"
+                        if print_trace:
+                            print(msg)
+                        if trace_file:
+                            trace_file.write(msg + '\n')
+                            trace_file.flush()
+            else:
+                for event in events:
+                    if print_trace or trace_file:
+                        msg = f"[phase 3, rank {dist.get_rank()}], kernel={kernel_name}, start_timestamp={event['ts']}, duration={event['dur']}"
+                        if print_trace:
+                            print(msg)
+                        if trace_file:
+                            trace_file.write(msg + '\n')
+                            trace_file.flush()
+                assert len(durations) % num_kernels_per_period == 0
+                num_kernel_patterns = len(durations) // num_kernels_per_period
+                kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns for j in range(num_kernels_per_period)]
 
     # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]
