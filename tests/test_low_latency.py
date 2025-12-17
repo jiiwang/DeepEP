@@ -1,330 +1,309 @@
-import argparse
-import random
+import inspect
+import json
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import os
+import sys
 import torch
 import torch.distributed as dist
-from functools import partial
-from typing import Literal, Set
-
-import deep_ep
-from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
+from typing import Optional, Union
 
 
-def simulate_failure_and_skip(rank: int, api: Literal["dispatch", "combine", "clean"], expected_masked_ranks: Set[int]):
-    # Simulates rank failure when the rank first calls the corresponding communication API
-    failed_api_ranks = {
-        # API -> rank to fail (rank fails when it first calls the corresponding communication API)
-        'dispatch': 1,
-        'combine': 3,
-        'clean': 5
+def init_dist(local_rank: int, num_local_ranks: int):
+    # NOTES: you may rewrite this function with your own cluster settings
+    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    port = int(os.getenv('MASTER_PORT', '8361'))
+    num_nodes = int(os.getenv('WORLD_SIZE', 1))
+    node_rank = int(os.getenv('RANK', 0))
+
+    sig = inspect.signature(dist.init_process_group)
+    params = {
+        'backend': 'nccl',
+        'init_method': f'tcp://{ip}:{port}',
+        'world_size': num_nodes * num_local_ranks,
+        'rank': node_rank * num_local_ranks + local_rank,
     }
-    if rank in expected_masked_ranks:
-        # Rank already failed
-        return True
-    if api in failed_api_ranks.keys():
-        expected_masked_ranks.add(failed_api_ranks[api])
-        if failed_api_ranks[api] == rank:
-            print(f"Rank {rank} failed when first calling {api} communication API, exit...", flush=True)
-            return True
-    return False
+    if 'device_id' in sig.parameters:
+        # noinspection PyTypeChecker
+        params['device_id'] = torch.device(f'cuda:{local_rank}')
+    dist.init_process_group(**params)
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('cuda')
+    torch.cuda.set_device(local_rank)
+
+    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
 
 
-def query_mask_buffer_and_check(api: Literal["dispatch", "combine", "clean"], buffer: deep_ep.Buffer, mask_status: torch.Tensor,
-                                expected_masked_ranks: Set[int]):
-    buffer.low_latency_query_mask_buffer(mask_status)
-    assert set(mask_status.nonzero().squeeze(-1).tolist()) == expected_masked_ranks
+def calc_diff(x: torch.Tensor, y: torch.Tensor):
+    x, y = x.double() + 1, y.double() + 1
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return (1 - sim).item()
 
 
-def test_main(num_tokens: int,
-              hidden: int,
-              num_experts: int,
-              num_topk: int,
-              rank: int,
-              num_ranks: int,
-              group: dist.ProcessGroup,
-              buffer: deep_ep.Buffer,
-              use_logfmt: bool = False,
-              shrink_test: bool = False,
-              seed: int = 0):
-    torch.manual_seed(seed + rank)
-    random.seed(seed + rank)
-
-    assert num_experts % num_ranks == 0
-    num_local_experts = num_experts // num_ranks
-
-    # NOTES: the integers greater than 256 exceed the BF16 precision limit
-    rank_offset = 128
-    assert num_ranks - rank_offset < 257, 'Too many ranks (exceeding test precision limit)'
-
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * (rank - rank_offset)
-    x[:, -128:] = torch.arange(num_tokens, device='cuda').to(torch.bfloat16).view(-1, 1)
-    x_list = [x]
-    for _ in range(4 if use_logfmt else 0):
-        # NOTES: make more LogFMT casts and also with some BF16
-        x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.5 * random.random())
-    # NOTES: the last one is for performance testing
-    # Most of the values in the perf case is lower than the threshold, casting most channels
-    x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.1)
-
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
-    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
-
-    # Randomly mask some positions
-    for _ in range(10):
-        topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
-
-    all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
-    dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
-
-    # For failure simulation and shrink testing
-    mask_status = torch.zeros((num_ranks, ), dtype=torch.int, device='cuda')
-    expected_masked_ranks = set()
-
-    # Check dispatch correctness
-    do_check = True
-    hash_value, num_times = 0, 0
-    for current_x in x_list:
-        for return_recv_hook in (False, True):
-            for dispatch_use_fp8 in (False, True):
-                for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
-                    for use_ue8m0 in (False, True) if round_scale else (False, ):
-                        if shrink_test and simulate_failure_and_skip(rank, "dispatch", expected_masked_ranks):
-                            break
-                        num_times += 1
-                        for _ in range((num_times % 2) + 1):
-                            cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
-                            packed_recv_x, packed_recv_count, handle, event, hook = \
-                                buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
-                                                            use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
-                                                            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                                                            async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
-                            hook() if return_recv_hook else event.current_stream_wait()
-                        if shrink_test:
-                            query_mask_buffer_and_check("dispatch", buffer, mask_status, expected_masked_ranks)
-                        packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
-                        simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
-                            if dispatch_use_fp8 else packed_recv_x.clone()
-                        for i in range(num_local_experts if do_check else 0):
-                            expert_id = rank * num_local_experts + i
-                            recv_x = per_token_cast_back(packed_recv_x[0][i], packed_recv_x[1][i]) if dispatch_use_fp8 else packed_recv_x[i]
-                            recv_count, recv_src_info, recv_layout_range = packed_recv_count[i], handle[0][i], handle[1][i]
-
-                            # Check expert indices
-                            int_mask = (2**32) - 1
-                            num_valid_tokens = recv_count.item()
-                            assert cumulative_local_expert_recv_stats[i].item(
-                            ) == num_valid_tokens, f'{cumulative_local_expert_recv_stats[i].item()} != {num_valid_tokens}'
-                            assert num_valid_tokens == (
-                                recv_layout_range
-                                & int_mask).sum().item(), f'{num_valid_tokens} != {recv_layout_range & int_mask}.sum().item()'
-                            assert num_valid_tokens == (all_topk_idx == expert_id).sum(dim=[1, 2])[mask_status == 0].sum().item(
-                            ), f'{num_valid_tokens} != {(all_topk_idx == expert_id).sum(dim=[1, 2])[mask_status==0].sum().item()}'
-
-                            if num_valid_tokens == 0:
-                                continue
-                            # Check received data
-                            if current_x is x:
-                                recv_x = recv_x[:num_valid_tokens]
-                                recv_x_amin = recv_x[:, :-128].amin(dim=-1)
-                                recv_src_info = recv_src_info[:num_valid_tokens]
-                                assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1))
-                                if round_scale:
-                                    assert calc_diff(recv_x[:, -1], recv_src_info.view(-1)) < 0.007
-                                else:
-                                    assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0
-                                for j in range(num_ranks):
-                                    if shrink_test and mask_status[j]:
-                                        continue
-                                    begin_idx, count = (recv_layout_range[j] >> 32).item(), (recv_layout_range[j] & int_mask).item()
-                                    if not round_scale:
-                                        assert (recv_x_amin == j - rank_offset).sum().item() == (all_topk_idx[j] == expert_id).sum().item()
-                                        assert (recv_x[begin_idx:begin_idx + count, :-128] - j + rank_offset).sum().item() == 0
-                            if dispatch_use_fp8:
-                                hash_value ^= hash_tensor(packed_recv_x[0][i, :num_valid_tokens])
-                                hash_value ^= hash_tensor(packed_recv_x[1][i, :num_valid_tokens])
-                            else:
-                                hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
-
-                        # Check combine correctness
-                        if shrink_test and simulate_failure_and_skip(rank, "combine", expected_masked_ranks):
-                            break
-                        for zero_copy in (False, ) if use_logfmt else (False, True):
-                            if zero_copy:
-                                buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-                            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-                            combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x,
-                                                                                 topk_idx,
-                                                                                 topk_weights,
-                                                                                 handle,
-                                                                                 use_logfmt=use_logfmt,
-                                                                                 async_finish=not return_recv_hook,
-                                                                                 zero_copy=zero_copy,
-                                                                                 return_recv_hook=return_recv_hook,
-                                                                                 out=out)
-                            hook() if return_recv_hook else event.current_stream_wait()
-                            if shrink_test:
-                                query_mask_buffer_and_check("combine", buffer, mask_status, expected_masked_ranks)
-                            if do_check:
-                                if shrink_test:
-                                    owner_by_expert = (torch.arange(num_experts, device='cuda') // num_local_experts)
-                                    fail_owner_mask = (mask_status == 1).index_select(0, owner_by_expert)
-                                    valid_topk_idx = topk_idx >= 0
-                                    failed_topk_idx = torch.zeros_like(topk_idx, device='cuda', dtype=torch.bool)
-                                    failed_topk_idx[valid_topk_idx] = fail_owner_mask.index_select(0, topk_idx[valid_topk_idx])
-                                    topk_idx[failed_topk_idx] = -1
-                                diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
-                                assert torch.isnan(combined_x).sum().item() == 0
-                                if not round_scale:
-                                    assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}'
-                                hash_value ^= hash_tensor(combined_x)
-
-                        # Clean buffer API
-                        if shrink_test:
-                            if simulate_failure_and_skip(rank, "clean", expected_masked_ranks):
-                                break
-
-                            buffer.clean_low_latency_buffer(num_tokens, hidden, num_experts)
-                            query_mask_buffer_and_check("clean", buffer, mask_status, expected_masked_ranks)
-
-    if shrink_test:
-        return
-
-    # noinspection PyShadowingNames
-    def large_gemm_with_hook(hook):
-        mat_0 = torch.randn((8192, 8192), dtype=torch.float)
-        mat_1 = torch.randn((8192, 8192), dtype=torch.float)
-        mat_0 @ mat_1
-        hook()
-
-    # noinspection PyShadowingNames
-    def test_func(return_recv_hook: bool):
-        recv_x, recv_count, handle, event, hook = \
-            buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
-                                        cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                                        use_fp8=True, async_finish=False, return_recv_hook=return_recv_hook)
-        large_gemm_with_hook(hook) if return_recv_hook else None
-        combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x,
-                                                             topk_idx,
-                                                             topk_weights,
-                                                             handle,
-                                                             use_logfmt=use_logfmt,
-                                                             return_recv_hook=return_recv_hook)
-        large_gemm_with_hook(hook) if return_recv_hook else None
-
-    # Calculate bandwidth
-    num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
-    num_logfmt10_bytes = hidden * 10 / 8 + hidden / 128 * 4
-    num_dispatch_comm_bytes, num_combine_comm_bytes = 0, 0
-    for i in range(num_tokens):
-        num_selections = (topk_idx[i] != -1).sum().item()
-        num_dispatch_comm_bytes += num_fp8_bytes * num_selections
-        num_combine_comm_bytes += (num_logfmt10_bytes if use_logfmt else num_bf16_bytes) * num_selections
-
-    # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
-    print(
-        f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
-        f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us',
-        flush=True)
-
-    # Separate profiling
-    for return_recv_hook in (False, True):
-        group.barrier()
-        dispatch_t, combine_t = bench_kineto(partial(test_func, return_recv_hook=return_recv_hook),
-                                             kernel_names=('dispatch', 'combine'),
-                                             barrier_comm_profiling=True,
-                                             suppress_kineto_output=True,
-                                             num_kernels_per_period=2 if return_recv_hook else 1)
-        if not return_recv_hook:
-            print(
-                f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
-                f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us',
-                flush=True)
-        else:
-            print(
-                f'[rank {rank}] Dispatch send/recv time: {dispatch_t[0] * 1e6:.2f} + {dispatch_t[1] * 1e6:.2f} us | '
-                f'Combine send/recv time: {combine_t[0] * 1e6:.2f} + {combine_t[1] * 1e6:.2f} us',
-                flush=True)
-    return hash_value
+def align_up(x, y):
+    return (x + y - 1) // y * y
 
 
-# noinspection PyUnboundLocalVariable,PyShadowingNames
-def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    num_tokens, hidden = args.num_tokens, args.hidden
-    num_topk, num_experts = args.num_topk, args.num_experts
-
-    num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
-    if local_rank == 0:
-        print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
-    buffer = deep_ep.Buffer(group,
-                            num_rdma_bytes=num_rdma_bytes,
-                            low_latency_mode=True,
-                            num_qps_per_rank=num_experts // num_ranks,
-                            allow_nvlink_for_low_latency_mode=not args.disable_nvlink,
-                            explicitly_destroy=True,
-                            allow_mnnvl=args.allow_mnnvl,
-                            enable_shrink=args.shrink_test)
-    test_main(num_tokens,
-              hidden,
-              num_experts,
-              num_topk,
-              rank,
-              num_ranks,
-              group,
-              buffer,
-              use_logfmt=args.use_logfmt,
-              shrink_test=args.shrink_test,
-              seed=1)
-
-    do_pressure_test = args.pressure_test
-    for seed in range(int(1e9) if do_pressure_test else 0):
-        if local_rank == 0:
-            print(f'Testing with seed {seed} ...', flush=True)
-        ref_hash = test_main(num_tokens,
-                             hidden,
-                             num_experts,
-                             num_topk,
-                             rank,
-                             num_ranks,
-                             group,
-                             buffer,
-                             use_logfmt=args.use_logfmt,
-                             seed=seed)
-        for _ in range(20):
-            assert test_main(num_tokens,
-                             hidden,
-                             num_experts,
-                             num_topk,
-                             rank,
-                             num_ranks,
-                             group,
-                             buffer,
-                             use_logfmt=args.use_logfmt,
-                             seed=seed) == ref_hash, f'Error: seed={seed}'
-
-    # Destroy the buffer runtime and communication group
-    buffer.destroy()
-    dist.barrier()
-    dist.destroy_process_group()
+def per_token_cast_to_fp8(x: torch.Tensor):
+    assert x.dim() == 2
+    m, n = x.shape
+    aligned_n = align_up(n, 128)
+    x_padded = torch.nn.functional.pad(x, (0, aligned_n - n), mode='constant', value=0)
+    x_padded_view = x_padded.view(m, -1, 128)
+    x_amax = x_padded_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    return (x_padded_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
+        m, aligned_n)[:, :n].contiguous(), (x_amax / 448.0).view(m, -1)
 
 
-if __name__ == '__main__':
-    # TODO: you may modify NUMA binding for less CPU overhead
-    # TODO: buggy with `num_tokens=512`
-    parser = argparse.ArgumentParser(description='Test low-latency EP kernels')
-    parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
-    parser.add_argument('--num-tokens', type=int, default=128, help='Number of tokens (default: 128)')
-    parser.add_argument('--hidden', type=int, default=7168, help='Hidden dimension size (default: 7168)')
-    parser.add_argument('--num-topk', type=int, default=8, help='Number of top-k experts (default: 8)')
-    parser.add_argument('--num-experts', type=int, default=288, help='Number of experts (default: 288)')
-    parser.add_argument('--allow-mnnvl', action="store_true", help='Allow MNNVL for communication')
-    parser.add_argument('--disable-nvlink', action='store_true', help='Whether to disable NVLink for testing')
-    parser.add_argument('--use-logfmt', action='store_true', help='Whether to test LogFMT combine')
-    parser.add_argument("--pressure-test", action='store_true', help='Whether to do pressure test')
-    parser.add_argument("--shrink-test", action='store_true', help='Whether to simulate failure and test shrink mode')
-    args = parser.parse_args()
+def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
+    if x_fp8.numel() == 0:
+        return x_fp8.to(torch.bfloat16)
 
-    num_processes = args.num_processes
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    assert x_fp8.dim() == 2
+    m, n = x_fp8.shape
+    aligned_n = align_up(n, 128)
+    x_fp8_padded = torch.nn.functional.pad(x_fp8, (0, aligned_n - n), mode='constant', value=0)
+    if x_scales.dtype == torch.int:
+        x_scales = x_scales.view(dtype=torch.uint8).to(torch.int) << 23
+        x_scales = x_scales.view(dtype=torch.float)
+    x_fp32_padded = x_fp8_padded.to(torch.float32).view(x_fp8.size(0), -1, 128)
+    x_scales = x_scales.view(x_fp8.size(0), -1, 1)
+    return (x_fp32_padded * x_scales).view(x_fp8_padded.shape).to(torch.bfloat16)[:, :n].contiguous()
+
+
+def inplace_unique(x: torch.Tensor, num_slots: int):
+    assert x.dim() == 2
+    mask = x < 0
+    x_padded = x.masked_fill(mask, num_slots)
+    bin_count = torch.zeros((x.size(0), num_slots + 1), dtype=x.dtype, device=x.device)
+    bin_count.scatter_add_(1, x_padded, torch.ones_like(x_padded))
+    bin_count = bin_count[:, :num_slots]
+    sorted_bin_count, sorted_bin_idx = torch.sort(bin_count, dim=-1, descending=True)
+    sorted_bin_idx.masked_fill_(sorted_bin_count == 0, -1)
+    sorted_bin_idx = torch.sort(sorted_bin_idx, descending=True, dim=-1).values
+    x[:, :].fill_(-1)
+    valid_len = min(num_slots, x.size(1))
+    x[:, :valid_len] = sorted_bin_idx[:, :valid_len]
+
+
+def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_groups: int):
+    num_tokens, num_experts = scores.shape
+    scores = scores.view(num_tokens, num_groups, -1)
+    mask = torch.zeros((num_tokens, num_groups), dtype=torch.bool, device=scores.device)
+    mask = mask.scatter_(1, group_idx, True).unsqueeze(-1).expand_as(scores)
+    return (scores * mask).view(num_tokens, num_experts)
+
+
+def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None, print_trace: bool = False, trace_file=None):
+    # Flush L2 cache with 256 MB data
+    torch.cuda.synchronize()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+
+    # Warmup
+    for _ in range(num_warmups):
+        fn()
+
+    # Flush L2
+    cache.zero_()
+
+    # Testing
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    for i in range(num_tests):
+        # Record
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+        if post_fn is not None:
+            post_fn()
+    torch.cuda.synchronize()
+
+    times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])[1:]
+    raw_events = [[start_events[0].elapsed_time(s) * 1e3, s.elapsed_time(e) * 1e3] for s, e in zip(start_events, end_events)][1:]
+    
+    for s, duration in raw_events:
+        if print_trace or trace_file:
+            msg = f"[phase 1, rank {dist.get_rank()}], kernel=combined, start_timestamp={s}, duration={duration} us"
+            if print_trace:
+                print(msg)
+            if trace_file:
+                trace_file.write(msg + '\n')
+                trace_file.flush()
+
+    return np.average(times), np.min(times), np.max(times)
+
+
+class empty_suppress:
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+
+class suppress_stdout_stderr:
+
+    def __enter__(self):
+        self.outnull_file = open(os.devnull, 'w')
+        self.errnull_file = open(os.devnull, 'w')
+
+        self.old_stdout_fileno_undup = sys.stdout.fileno()
+        self.old_stderr_fileno_undup = sys.stderr.fileno()
+
+        self.old_stdout_fileno = os.dup(sys.stdout.fileno())
+        self.old_stderr_fileno = os.dup(sys.stderr.fileno())
+
+        self.old_stdout = sys.stdout
+        self.old_stderr = sys.stderr
+
+        os.dup2(self.outnull_file.fileno(), self.old_stdout_fileno_undup)
+        os.dup2(self.errnull_file.fileno(), self.old_stderr_fileno_undup)
+
+        sys.stdout = self.outnull_file
+        sys.stderr = self.errnull_file
+        return self
+
+    def __exit__(self, *_):
+        sys.stdout = self.old_stdout
+        sys.stderr = self.old_stderr
+
+        os.dup2(self.old_stdout_fileno, self.old_stdout_fileno_undup)
+        os.dup2(self.old_stderr_fileno, self.old_stderr_fileno_undup)
+
+        os.close(self.old_stdout_fileno)
+        os.close(self.old_stderr_fileno)
+
+        self.outnull_file.close()
+        self.errnull_file.close()
+
+
+def bench_kineto(fn,
+                 kernel_names: Union[str, tuple],
+                 num_tests: int = 30,
+                 num_warmups: int = 30,
+                 suppress_kineto_output: bool = False,
+                 trace_path: Optional[str] = None,
+                 barrier_comm_profiling: bool = False,
+                 num_kernels_per_period: int = 1,
+                 print_trace: bool = False,
+                 trace_file=None):
+    # Profile
+    suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
+    with suppress():
+        schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
+            for step in range(2):
+                # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
+                if barrier_comm_profiling:
+                    lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                    rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                    lhs @ rhs
+                    dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
+                # Use fewer iterations for the warm-up step (step 0)
+                current_num_tests = num_warmups if step == 0 else num_tests
+                for _ in range(current_num_tests):
+                    fn()
+                torch.cuda.synchronize()
+                prof.step()
+
+    # Parse the profiling table
+    assert isinstance(kernel_names, (str, tuple))
+    is_tuple = isinstance(kernel_names, tuple)
+    prof_lines = prof.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
+    kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
+    assert all([isinstance(name, str) for name in kernel_names])
+    for name in kernel_names:
+        assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
+
+    # Save chrome traces
+    # if trace_path is not None:
+    #    prof.export_chrome_trace(trace_path)
+
+    # Export trace
+    profile_data = None
+    if trace_path is not None:
+        prof.export_chrome_trace(trace_path)
+        if num_kernels_per_period >= 1:
+            profile_data = json.loads(Path(trace_path).read_text())
+    elif num_kernels_per_period >= 1:
+        with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
+            prof.export_chrome_trace(tmp.name)
+            profile_data = json.loads(Path(tmp.name).read_text())
+    
+    # Get GEMM timestamps and durations
+    if num_kernels_per_period > 1 and profile_data is not None:
+        # Filter for events that actually have timing info
+        all_events = [event for event in profile_data['traceEvents'] if 'gemm' in event['name'].lower()]
+        # Sort by timestamp
+        all_events.sort(key=lambda x: x['ts'])
+        
+        # Skip the first warm-up run
+        if barrier_comm_profiling:
+            if len(all_events) > 0:
+                all_events = all_events[1:]
+
+        for event in all_events:
+            if print_trace or trace_file:
+                msg = f"[phase 3, rank {dist.get_rank()}], kernel=gemm, start_timestamp={event['ts']}, duration={event['dur']}"
+                if print_trace:
+                    print(msg)
+                if trace_file:
+                    trace_file.write(msg + '\n')
+                    trace_file.flush()
+
+    # Return average kernel durations
+    units = {'ms': 1e3, 'us': 1e6}
+    kernel_durations = []
+    for name in kernel_names:
+        for line in prof_lines:
+            if name in line:
+                time_str = line.split()[-2]
+                for unit, scale in units.items():
+                    if unit in time_str:
+                        kernel_durations.append(float(time_str.replace(unit, '')) / scale)
+                        break
+                break
+
+    # Expand the kernels by periods
+    if num_kernels_per_period >= 1 and profile_data is not None:
+        # with tempfile.NamedTemporaryFile(suffix='.json') as tmp:
+        #    prof.export_chrome_trace(tmp.name)
+        #    profile_data = json.loads(Path(tmp.name).read_text())
+
+        for i, kernel_name in enumerate(kernel_names):
+            events = [event for event in profile_data['traceEvents'] if f'::{kernel_name}' in event['name']]
+            events = sorted(events, key=lambda event: event['ts'])
+            durations = [event['dur'] / 1e6 for event in events]
+            
+            if num_kernels_per_period == 1:
+                for event in events:
+                    if print_trace or trace_file:
+                        msg = f"[phase 2, rank {dist.get_rank()}], kernel={kernel_name}, start_timestamp={event['ts']}, duration={event['dur']}"
+                        if print_trace:
+                            print(msg)
+                        if trace_file:
+                            trace_file.write(msg + '\n')
+                            trace_file.flush()
+            else:
+                for event in events:
+                    if print_trace or trace_file:
+                        msg = f"[phase 3, rank {dist.get_rank()}], kernel={kernel_name}, start_timestamp={event['ts']}, duration={event['dur']}"
+                        if print_trace:
+                            print(msg)
+                        if trace_file:
+                            trace_file.write(msg + '\n')
+                            trace_file.flush()
+                assert len(durations) % num_kernels_per_period == 0
+                num_kernel_patterns = len(durations) // num_kernels_per_period
+                kernel_durations[i] = [sum(durations[j::num_kernels_per_period]) / num_kernel_patterns for j in range(num_kernels_per_period)]
+
+    # Return execution durations
+    return kernel_durations if is_tuple else kernel_durations[0]
+
+
+def hash_tensor(t: torch.Tensor):
+    return t.view(torch.int).sum().item()
