@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import os
 import random
 import torch
 import torch.distributed as dist
@@ -284,8 +285,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     trace_file = None
     if args.save_trace:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"trace_rank{rank}_{timestamp}.log"
+        filename = os.path.join(args.trace_dir, f"trace_rank{rank}.log")
         trace_file = open(filename, "w")
 
     try:
@@ -367,6 +367,11 @@ if __name__ == '__main__':
     parser.add_argument('--print-trace', action='store_true', help='Whether to print trace outputs')
     parser.add_argument('--save-trace', action='store_true', help='Whether to save trace outputs to file')
     args = parser.parse_args()
+
+    if args.save_trace:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.trace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{args.num_experts}_experts_{args.num_tests}_tests_{timestamp}")
+        os.makedirs(args.trace_dir, exist_ok=True)
 
     num_processes = args.num_processes
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
