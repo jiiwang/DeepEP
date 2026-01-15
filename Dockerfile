@@ -1,7 +1,7 @@
 ARG CUDA_VERSION=12.9.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
-ARG DEEPEP_COMMIT=dbe63eaed372d7c2da8072085940e7338fcb8cf9
+ARG DEEPEP_COMMIT=5e5c89dde869bed56b3995ca9f1d1b5916526aab
 ENV NVSHMEM_HOME=/workspace/nvshmem/install
 ENV MPI_HOME=/usr/lib/x86_64-linux-gnu/openmpi
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
